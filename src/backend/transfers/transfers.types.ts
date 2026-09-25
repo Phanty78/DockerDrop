@@ -72,12 +72,14 @@ export const TRANSFER_TRANSITIONS: Readonly<Record<TransferStatus, readonly Tran
   expired: [],
 };
 
-/** Terminal statuses of the §8 lifecycle: no transition ever leaves them. */
-export const TERMINAL_TRANSFER_STATUSES: readonly TransferStatus[] = [
-  "completed",
-  "failed",
-  "expired",
-];
+/**
+ * Terminal statuses of the §8 lifecycle: no transition ever leaves them. Derived
+ * from TRANSFER_TRANSITIONS (a terminal status is a row with no outgoing
+ * transition) so the terminal list and the transition table cannot drift.
+ */
+export const TERMINAL_TRANSFER_STATUSES: readonly TransferStatus[] = (
+  Object.keys(TRANSFER_TRANSITIONS) as readonly TransferStatus[]
+).filter((status) => TRANSFER_TRANSITIONS[status].length === 0);
 
 export type TransferErrorCode =
   | "TRANSFER_BODY_INVALID"
@@ -87,7 +89,7 @@ export type TransferErrorCode =
   | "TRANSFER_TRANSITION_INVALID"
   | "TRANSFER_EXPIRED";
 
-/** Explicit, loggable error raised when a transfer creation is refused. */
+/** Explicit, loggable error raised when a transfer creation or status change is refused. */
 export class TransferError extends Error {
   readonly code: TransferErrorCode;
 
@@ -148,6 +150,9 @@ export interface TransferStore {
  * Port notified exactly once per valid transition to "ready" (§8, §16.6):
  * Google Chat lands behind it in task 16.8. Never called for "created",
  * "preparing", "uploading", invalid or refused transitions.
+ * Implementations MUST never throw: a notification failure must never affect
+ * the already-committed "ready" state (§8). The callsite guards defensively and
+ * logs, so a throwing adapter cannot turn a committed PATCH into an error.
  */
 export interface TransferReadyNotifier {
   notifyReady(record: TransferRecord): void;

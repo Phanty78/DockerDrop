@@ -28,7 +28,7 @@ function errorResponse(status: number, code: TransferErrorCode, message: string)
  * the colleagues configuration. Any other failure is not swallowed: it propagates to
  * the caller (the backend server), which owns logging.
  *
- * The handler is synchronous and side-effect free beyond the in-memory store.
+ * The handler is synchronous; its only side effect is the in-memory store.
  */
 export function postTransfersHandler(
   rawBody: string,
@@ -77,7 +77,9 @@ export function postTransfersHandler(
  * window elapsed. Any other failure is not swallowed: it propagates to the caller (the
  * backend server), which owns logging.
  *
- * The handler is synchronous and side-effect free beyond the in-memory store.
+ * The handler is synchronous; its only side effects are the in-memory store and the
+ * injected ready-only notifier port (`deps.notifier`), which fires exactly once per valid
+ * transition to "ready" (§8, task 16.6).
  */
 export function patchTransfersHandler(
   rawBody: string,

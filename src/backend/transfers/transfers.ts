@@ -255,8 +255,18 @@ export const applyTransferStatus: ApplyTransferStatus = (
   store.update(updated);
 
   // The ready-only port sees the committed record, once, after the commit (§16.6).
+  // §8 isolation is enforced here, structurally: the record is already committed, so a
+  // throwing notifier (the 16.8 Google Chat webhook) must never fail this PATCH nor turn
+  // an already-ready transfer into an error — the failure is logged and left behind.
   if (status === "ready") {
-    deps.notifier?.notifyReady(updated);
+    try {
+      deps.notifier?.notifyReady(updated);
+    } catch (error) {
+      console.error(
+        `[transfer-notifier] ready notification failed for transfer ${updated.id} (transfer stays ready, §8):`,
+        error,
+      );
+    }
   }
 
   if (archiveSize === undefined) {

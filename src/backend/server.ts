@@ -102,7 +102,11 @@ Bun.serve({
       try {
         transferId = decodeURIComponent(url.pathname.slice("/transfers/".length));
       } catch {
-        // Malformed percent-encoding names no transfer: answer like any unknown path.
+        // Deliberate choice: a malformed request-target names no transfer, so it answers
+        // the plain 404 exactly like the blank-id case below, not the JSON
+        // TRANSFER_NOT_FOUND a well-formed unknown id yields. RFC 9110 would justify a
+        // 400 here; 404 is kept for consistency with the local-only MVP, and the
+        // 405-vs-404 nuances are deferred.
         return new Response("Not Found", { status: 404 });
       }
       // A blank id is not a transfer id: fall through to the 404 below.

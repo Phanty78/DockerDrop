@@ -21,7 +21,8 @@ import { patchTransfersHandler } from "../../../src/backend/http/transfers.route
  * TRANSFER_NOT_FOUND for an unknown id, 409 TRANSFER_TRANSITION_INVALID for a forbidden
  * pair, 409 TRANSFER_EXPIRED for a transfer whose retention window elapsed. Every response
  * carries the JSON content type. The handler is synchronous: it parses, delegates to
- * `applyTransferStatus` and maps; only the in-memory store is mutated.
+ * `applyTransferStatus` and maps; the in-memory store is mutated, and a valid transition
+ * to "ready" fires the injected ready-only notifier port.
  */
 
 /** Frozen clock: the real clock must never decide whether a seeded record is expired. */
@@ -32,6 +33,16 @@ const RETENTION_MS = 3_600_000;
 const DEPS: ApplyTransferStatusDeps = { now: () => FIXED_NOW };
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
+
+/** Runs `run` and returns whatever it threw; fails loudly when it returned normally. */
+function captureThrown(run: () => unknown): unknown {
+  try {
+    run();
+  } catch (error) {
+    return error;
+  }
+  throw new Error("Expected the call to throw, but it returned normally.");
+}
 
 /**
  * Seeds a store exactly as task 16.4 would have: `created`, future `expiresAt`, and only
@@ -317,6 +328,7 @@ describe("patchTransfersHandler", () => {
       );
 
       expect(step.status).toBe(200);
+      expect(step.headers.get("content-type")).toBe(JSON_CONTENT_TYPE);
     }
     // Neither "preparing" nor "uploading" may fire the ready port.
     expect(notifier.notified).toEqual([]);
@@ -329,6 +341,7 @@ describe("patchTransfersHandler", () => {
     );
 
     expect(ready.status).toBe(200);
+    expect(ready.headers.get("content-type")).toBe(JSON_CONTENT_TYPE);
     expect(notifier.notified).toHaveLength(1);
     // The port carries the committed record: status already persisted when it fires.
     expect(notifier.notified[0]).toEqual(store.get(record.id) as TransferRecord);
@@ -386,5 +399,32 @@ describe("patchTransfersHandler", () => {
     ]);
     // The record keeps the reported size: later tasks read it from the store.
     expect(store.get(record.id)?.archiveSize).toBe(408021221);
+  });
+
+  it("laisse remonter une erreur inattendue du store", () => {
+    const record = makeRecord("tr_store_boom");
+    const boom = new Error("boom-sentinel");
+    // Only TransferError is mapped to a JSON 4xx/5xx body: every other failure must reach
+    // the backend server's error callback untouched (opaque 500), exactly like POST.
+    const store: TransferStore = {
+      add() {},
+      get: () => record,
+      update() {
+        throw boom;
+      },
+      list: () => [],
+    };
+
+    const error = captureThrown(() =>
+      patchTransfersHandler(
+        JSON.stringify({ status: "preparing" }),
+        record.id,
+        DEPS,
+        store,
+      ),
+    );
+
+    // The very sentinel thrown by the store propagates out of the handler.
+    expect(error).toBe(boom);
   });
 });

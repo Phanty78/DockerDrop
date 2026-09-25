@@ -408,7 +408,11 @@ describe("applyTransferStatus", () => {
 
   it("notifie uniquement au passage valide à ready", () => {
     const { notifier, readyRecords } = recordingNotifier();
-    const store = storeWith(makeRecord("tr_notify", "created"));
+    const store = storeWith(
+      makeRecord("tr_notify", "created"),
+      // Second record kept in "created" to exercise a refused jump straight to "ready".
+      makeRecord("tr_notify_jump", "created"),
+    );
     const depsWithNotifier = deps({ notifier });
 
     applyTransferStatus("tr_notify", { status: "preparing" }, store, depsWithNotifier);
@@ -420,6 +424,15 @@ describe("applyTransferStatus", () => {
       applyTransferStatus("tr_notify", { status: "completed" }, store, depsWithNotifier),
     );
     expectTransferError(refused, "TRANSFER_TRANSITION_INVALID");
+
+    // Refused jump straight to "ready" ("created" → "ready" is not a valid transition):
+    // the target status alone never decides the notification — no notification either.
+    const refusedReady = captureThrown(() =>
+      applyTransferStatus("tr_notify_jump", { status: "ready" }, store, depsWithNotifier),
+    );
+    expectTransferError(refusedReady, "TRANSFER_TRANSITION_INVALID");
+    expect(store.get("tr_notify_jump")?.status).toBe("created");
+    expect(readyRecords).toEqual([]);
 
     // Unknown transfer and invalid body paths never notify either.
     captureThrown(() =>
@@ -446,6 +459,47 @@ describe("applyTransferStatus", () => {
     applyTransferStatus("tr_notify", { status: "downloading" }, store, depsWithNotifier);
     applyTransferStatus("tr_notify", { status: "completed" }, store, depsWithNotifier);
     expect(readyRecords).toHaveLength(1);
+  });
+
+  it("préserve le transfert ready et la réponse quand le notifier échoue", () => {
+    // §8: a webhook failure (task 16.8) must never fail an already-committed PATCH.
+    const notifier: TransferReadyNotifier = {
+      notifyReady: () => {
+        throw new Error("webhook-down");
+      },
+    };
+    const store = storeWith(makeRecord("tr_notifier_down", "uploading"));
+    const originalConsoleError = console.error;
+    const logged: unknown[][] = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args);
+    };
+    try {
+      const response = applyTransferStatus(
+        "tr_notifier_down",
+        { status: "ready", archive_size: 408021221 },
+        store,
+        deps({ notifier }),
+      );
+
+      // The response and the committed record are the normal "ready" ones…
+      expect(response).toEqual({
+        id: "tr_notifier_down",
+        status: "ready",
+        archive_size: 408021221,
+        expires_at: FIXED_EXPIRES_AT,
+      });
+      expect(store.get("tr_notifier_down")).toEqual(
+        makeRecord("tr_notifier_down", "ready", { archiveSize: 408021221 }),
+      );
+      // …and the failure is journalised once, with the cause, never propagated.
+      expect(logged).toHaveLength(1);
+      expect(logged[0]?.[0]).toContain("[transfer-notifier]");
+      expect(logged[0]?.[0]).toContain("tr_notifier_down");
+      expect(logged[0]?.[1]).toBeInstanceOf(Error);
+    } finally {
+      console.error = originalConsoleError;
+    }
   });
 
   it("commite via store.update sans muter l'enregistrement précédent", () => {
