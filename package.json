@@ -6,7 +6,8 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "start": "bun src/backend/server.ts"
+    "start": "bun src/backend/server.ts",
+    "start:agent": "bun src/agent/server.ts"
   },
   "devDependencies": {
     "bun-types": "latest",
