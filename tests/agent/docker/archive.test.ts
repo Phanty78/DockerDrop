@@ -34,7 +34,7 @@ const FIXTURE_FILES = ["README.txt", "data/config.json", "data/notes.md"];
 /** Tar block size; the fixture tar length is a multiple of it, so the chunks stay aligned. */
 const CHUNK_SIZE = 512;
 
-/** Builds the reference tar of the fixture volume once, with the system tar. */
+/** Builds the reference tar of the fixture volume with the system tar. */
 function buildFixtureTar(): Buffer {
   const result = Bun.spawnSync(["tar", "-C", FIXTURE_DIR, "-cf", "-", "."]);
 
@@ -45,7 +45,19 @@ function buildFixtureTar(): Buffer {
   return result.stdout;
 }
 
-const FIXTURE_TAR = buildFixtureTar();
+let fixtureTarCache: Buffer | null = null;
+
+/**
+ * Reference tar of the fixture volume, built on first use so a broken fixture fails named tests,
+ * not the import.
+ */
+function fixtureTar(): Buffer {
+  if (fixtureTarCache === null) {
+    fixtureTarCache = buildFixtureTar();
+  }
+
+  return fixtureTarCache;
+}
 
 /** Splits `bytes` into 512-byte chunks so the archive code is fed progressively. */
 function toChunks(bytes: Uint8Array): Uint8Array[] {
@@ -198,7 +210,7 @@ describe("createVolumeArchive", () => {
     it("écrit une archive zstd à outputPath, renvoie sa taille et ne laisse aucun .part", async () => {
       const dir = await makeTempDir();
       const outputPath = join(dir, "volume.tar.zst");
-      const { source } = fakeSource(FIXTURE_TAR);
+      const { source } = fakeSource(fixtureTar());
 
       const result = await createVolumeArchive(
         { volumeName: "mysql_client_x", outputPath },
@@ -223,7 +235,7 @@ describe("createVolumeArchive", () => {
 
       await createVolumeArchive(
         { volumeName: "mysql_client_x", outputPath },
-        { tarSource: fakeSource(FIXTURE_TAR).source },
+        { tarSource: fakeSource(fixtureTar()).source },
       );
 
       const tarPath = decompressArchive(outputPath, dir);
@@ -245,7 +257,7 @@ describe("createVolumeArchive", () => {
 
       await createVolumeArchive(
         { volumeName: "mysql_client_x", outputPath },
-        { tarSource: fakeSource(FIXTURE_TAR).source },
+        { tarSource: fakeSource(fixtureTar()).source },
       );
 
       expect(listTarEntries(decompressArchive(outputPath, dir))).toEqual(FIXTURE_ENTRIES);
@@ -256,7 +268,7 @@ describe("createVolumeArchive", () => {
     it("accepte un nom entouré d'espaces et transmet le nom trimé à la source tar", async () => {
       const dir = await makeTempDir();
       const outputPath = join(dir, "volume.tar.zst");
-      const fake = fakeSource(FIXTURE_TAR);
+      const fake = fakeSource(fixtureTar());
 
       const result = await createVolumeArchive(
         { volumeName: "  mysql_client_x  ", outputPath },
@@ -280,7 +292,7 @@ describe("createVolumeArchive", () => {
       it(`rejette VOLUME_NAME_INVALID pour un nom ${label}`, async () => {
         const dir = await makeTempDir();
         const outputPath = join(dir, "volume.tar.zst");
-        const fake = fakeSource(FIXTURE_TAR);
+        const fake = fakeSource(fixtureTar());
 
         const error = await captureArchiveError(
           { volumeName, outputPath },
@@ -299,7 +311,7 @@ describe("createVolumeArchive", () => {
     it("rejette VOLUME_TAR_FAILED en conservant le message et le code de sortie de close()", async () => {
       const dir = await makeTempDir();
       const outputPath = join(dir, "volume.tar.zst");
-      const { source } = fakeSource(FIXTURE_TAR, {
+      const { source } = fakeSource(fixtureTar(), {
         closeError: new Error(
           'docker run alpine:3 tar failed with exit code 1: Error response from daemon: get mysql_client_x: no such volume',
         ),
@@ -318,7 +330,7 @@ describe("createVolumeArchive", () => {
     it("rejette VOLUME_TAR_FAILED quand le flux tar se rompt en cours de transfert", async () => {
       const dir = await makeTempDir();
       const outputPath = join(dir, "volume.tar.zst");
-      const { source } = fakeSource(FIXTURE_TAR, {
+      const { source } = fakeSource(fixtureTar(), {
         breakAfterChunks: 3,
         breakError: new Error("docker run interrupted: stream closed unexpectedly"),
       });
@@ -354,7 +366,7 @@ describe("createVolumeArchive", () => {
     it("rejette ARCHIVE_WRITE_FAILED quand le dossier de sortie n'existe pas", async () => {
       const dir = await makeTempDir();
       const outputPath = join(dir, "missing", "volume.tar.zst");
-      const { source } = fakeSource(FIXTURE_TAR);
+      const { source } = fakeSource(fixtureTar());
 
       const error = await captureArchiveError(
         { volumeName: "mysql_client_x", outputPath },
@@ -365,6 +377,34 @@ describe("createVolumeArchive", () => {
       // The message names the target and preserves the originating filesystem detail.
       expect(error.message).toContain(outputPath);
       expect(error.message).toContain("ENOENT");
+    });
+
+    it("rejette ARCHIVE_WRITE_FAILED quand outputPath existe déjà comme répertoire (rename impossible)", async () => {
+      const dir = await makeTempDir();
+      const outputPath = join(dir, "volume.tar.zst");
+      mkdirSync(outputPath); // rename() onto an existing directory fails (EISDIR).
+      const { source } = fakeSource(fixtureTar());
+
+      // captureArchiveError cannot be used here: its "nothing left at outputPath" check cannot
+      // hold, since the blocking directory IS outputPath. The rename failure is still asserted to
+      // reject, never resolve.
+      const settlement = await settle(
+        createVolumeArchive({ volumeName: "mysql_client_x", outputPath }, { tarSource: source }),
+      );
+
+      expect(settlement.status).toBe("rejected");
+      expect(settlement.error).toBeInstanceOf(VolumeArchiveError);
+
+      const error = settlement.error as VolumeArchiveError;
+      expect(error.code).toBe("ARCHIVE_WRITE_FAILED");
+
+      // The message names the target and the failed syscall: the .part open failure the ENOENT
+      // test covers would pass a bare `toContain(outputPath)` too, since the .part path contains it.
+      expect(error.message).toContain(outputPath);
+      expect(error.message).toContain("rename");
+      // The .part is cleaned up; the pre-existing directory at outputPath stays untouched.
+      expect(existsSync(`${outputPath}.part`)).toBe(false);
+      expect(existsSync(outputPath)).toBe(true);
     });
   });
 
@@ -389,53 +429,6 @@ describe("createVolumeArchive", () => {
       const tarPath = decompressArchive(outputPath, dir);
       expect(zstdDecompressSync(archive).length).toBe(0);
       expect(listTarEntries(tarPath)).toEqual([]);
-    });
-  });
-
-  describe("jamais de succès partiel", () => {
-    it("ne résout jamais quand close() échoue", async () => {
-      const dir = await makeTempDir();
-      const outputPath = join(dir, "volume.tar.zst");
-      const { source } = fakeSource(FIXTURE_TAR, { closeError: new Error("exit code 1") });
-
-      const settlement = await settle(
-        createVolumeArchive({ volumeName: "mysql_client_x", outputPath }, { tarSource: source }),
-      );
-
-      expect(settlement.status).toBe("rejected");
-      expect(settlement.error).toBeInstanceOf(VolumeArchiveError);
-      expect((settlement.error as VolumeArchiveError).code).toBe("VOLUME_TAR_FAILED");
-      expectNoArchiveLeft(outputPath);
-    });
-
-    it("ne résout jamais quand le flux tar se rompt", async () => {
-      const dir = await makeTempDir();
-      const outputPath = join(dir, "volume.tar.zst");
-      const { source } = fakeSource(FIXTURE_TAR, { breakAfterChunks: 2 });
-
-      const settlement = await settle(
-        createVolumeArchive({ volumeName: "mysql_client_x", outputPath }, { tarSource: source }),
-      );
-
-      expect(settlement.status).toBe("rejected");
-      expect(settlement.error).toBeInstanceOf(VolumeArchiveError);
-      expect((settlement.error as VolumeArchiveError).code).toBe("VOLUME_TAR_FAILED");
-      expectNoArchiveLeft(outputPath);
-    });
-
-    it("ne résout jamais quand le fichier de sortie est inécrivable", async () => {
-      const dir = await makeTempDir();
-      const outputPath = join(dir, "missing", "volume.tar.zst");
-      const { source } = fakeSource(FIXTURE_TAR);
-
-      const settlement = await settle(
-        createVolumeArchive({ volumeName: "mysql_client_x", outputPath }, { tarSource: source }),
-      );
-
-      expect(settlement.status).toBe("rejected");
-      expect(settlement.error).toBeInstanceOf(VolumeArchiveError);
-      expect((settlement.error as VolumeArchiveError).code).toBe("ARCHIVE_WRITE_FAILED");
-      expectNoArchiveLeft(outputPath);
     });
   });
 });

@@ -114,10 +114,14 @@ function createTestVolume(): string {
   return volumeName;
 }
 
-/** Force-removes a volume; `-f` also covers an already removed volume or one never created. */
+/** Force-removes a volume; CLI/spawn failures are ignored so cleanup never throws. */
 function removeTestVolume(volumeName: string): void {
-  runDocker(["volume", "rm", "-f", volumeName]);
   trackedVolumes.delete(volumeName);
+  try {
+    runDocker(["volume", "rm", "-f", volumeName]);
+  } catch {
+    // Spawn failure (docker CLI unspawnable): nothing created through Docker can leak.
+  }
 }
 
 /**
@@ -233,6 +237,11 @@ describe("createVolumeArchive", () => {
             readFileSync(join(FIXTURES_DIR, fixtureFile)),
           );
         }
+
+        // L'arbre extrait est exactement l'arbre fixture : rien de plus, rien de moins.
+        expect(readdirSync(extractDirectory, { recursive: true }).sort()).toEqual(
+          readdirSync(FIXTURES_DIR, { recursive: true }).sort(),
+        );
       } finally {
         removeTestVolume(volumeName);
       }
@@ -257,7 +266,7 @@ describe("createVolumeArchive", () => {
         expect(existsSync(`${archivePath}.part`)).toBe(false);
         expect(readdirSync(directory)).toEqual([]);
       } finally {
-        // The volume never existed; the forced removal proves the failure leaked nothing.
+        // The volume never existed; the empty directory asserted above proves nothing leaked.
         removeTestVolume(volumeName);
       }
     },
@@ -290,7 +299,7 @@ describe("createVolumeArchive", () => {
         expect(existsSync(`${archivePath}.part`)).toBe(false);
         expect(readdirSync(directory)).toEqual([]);
       } finally {
-        // The name is Engine-invalid; the forced removal proves the rejection leaked nothing.
+        // The name is Engine-invalid; the empty directory asserted above proves nothing leaked.
         removeTestVolume(volumeName);
       }
     },
