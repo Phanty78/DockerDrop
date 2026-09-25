@@ -4,10 +4,6 @@ import type { UsersConfig } from "../../../src/backend/config/users.types";
 import { getUsersHandler } from "../../../src/backend/http/users.route";
 
 /**
- * Task 16.1 — RED stage.
- * `getUsersHandler` does not exist yet: every test below is expected to fail
- * (module resolution failure) until the handler is implemented.
- *
  * Contract under test: `getUsersHandler(config: UsersConfig): Response`
  * exposes ONLY `{ items: [{ id, display_name }] }`.
  */

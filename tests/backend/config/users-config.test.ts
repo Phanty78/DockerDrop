@@ -78,6 +78,23 @@ async function captureUsersConfigError(
   return error;
 }
 
+/**
+ * Probes at module load (self-cleaning) whether chmod 000 actually blocks reads:
+ * a privileged user (or a filesystem ignoring permission bits) keeps read access,
+ * and the unreadable scenario must show as skipped, not silently pass.
+ */
+async function chmodBlocksRead(): Promise<boolean> {
+  const directory = await mkdtemp(join(tmpdir(), "dockerdrop-users-config-probe-"));
+  const probePath = join(directory, "probe.json");
+  await writeFile(probePath, "[]", "utf8");
+  await chmod(probePath, 0o000);
+  const blocked = !(await isReadable(probePath));
+  await rm(directory, { recursive: true, force: true });
+  return blocked;
+}
+
+const unreadableScenarioUnavailable = !(await chmodBlocksRead());
+
 describe("loadUsersConfig", () => {
   describe("config valide", () => {
     it("résout les collègues dans l'ordre du fichier et mappe name vers display_name", async () => {
@@ -93,6 +110,40 @@ describe("loadUsersConfig", () => {
     });
   });
 
+  describe("normalisation", () => {
+    it("trimme les ids et les noms chargés depuis le fichier", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "dockerdrop-users-config-"));
+      temporaryDirectories.push(directory);
+
+      const paddedPath = join(directory, "padded.json");
+      await writeFile(
+        paddedPath,
+        JSON.stringify([{ id: " mael ", name: "  Maël  " }]),
+        "utf8",
+      );
+
+      const config = await loadUsersConfig(paddedPath);
+
+      expect(config.items).toEqual([{ id: "mael", display_name: "Maël" }]);
+    });
+
+    it("rejette les ids en doublon après trim", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "dockerdrop-users-config-"));
+      temporaryDirectories.push(directory);
+
+      const duplicatePath = join(directory, "duplicate.json");
+      await writeFile(
+        duplicatePath,
+        JSON.stringify([
+          { id: "mael", name: "Maël" },
+          { id: " mael ", name: "Maël bis" },
+        ]),
+        "utf8",
+      );
+      await captureUsersConfigError(duplicatePath, "USERS_CONFIG_INVALID");
+    });
+  });
+
   describe("fichier absent", () => {
     it("rejette USERS_CONFIG_MISSING en conservant le chemin demandé", async () => {
       await captureUsersConfigError(MISSING_CONFIG_PATH, "USERS_CONFIG_MISSING");
@@ -100,20 +151,13 @@ describe("loadUsersConfig", () => {
   });
 
   describe("fichier illisible", () => {
-    it("rejette USERS_CONFIG_UNREADABLE quand le fichier ne peut pas être lu", async () => {
-      const path = await createUnreadableConfig();
-
-      if (await isReadable(path)) {
-        // A privileged user (or a filesystem ignoring permission bits) keeps read
-        // access after chmod 000: the scenario cannot be reproduced here.
-        console.warn(
-          `[users-config] ${path} reste lisible après chmod 000 (utilisateur privilégié ?) : cas USERS_CONFIG_UNREADABLE non vérifié.`,
-        );
-        return;
-      }
-
-      await captureUsersConfigError(path, "USERS_CONFIG_UNREADABLE");
-    });
+    it.skipIf(unreadableScenarioUnavailable)(
+      "rejette USERS_CONFIG_UNREADABLE quand le fichier ne peut pas être lu",
+      async () => {
+        const path = await createUnreadableConfig();
+        await captureUsersConfigError(path, "USERS_CONFIG_UNREADABLE");
+      },
+    );
   });
 
   describe("config invalide", () => {

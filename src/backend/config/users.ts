@@ -26,7 +26,7 @@ function invalidConfig(path: string, detail: string): UsersConfigError {
   );
 }
 
-/** Validates the parsed JSON document and maps `name` to `display_name`, preserving file order. */
+/** Validates the parsed JSON document; ids/names are trimmed, `name` mapped to `display_name`, file order preserved. */
 function parseUsersConfig(parsed: unknown, path: string): UsersConfig {
   if (!Array.isArray(parsed)) {
     throw invalidConfig(path, "expected a JSON array of colleagues");
@@ -45,15 +45,16 @@ function parseUsersConfig(parsed: unknown, path: string): UsersConfig {
     if (typeof id !== "string" || id.trim() === "") {
       throw invalidConfig(path, `entry #${index} must have a non-empty string "id"`);
     }
+    const trimmedId = id.trim();
     if (typeof name !== "string" || name.trim() === "") {
-      throw invalidConfig(path, `entry #${index} (id "${id}") must have a non-empty string "name"`);
+      throw invalidConfig(path, `entry #${index} (id "${trimmedId}") must have a non-empty string "name"`);
     }
-    if (seenIds.has(id)) {
-      throw invalidConfig(path, `entry #${index} repeats the id "${id}"`);
+    if (seenIds.has(trimmedId)) {
+      throw invalidConfig(path, `entry #${index} repeats the id "${trimmedId}"`);
     }
 
-    seenIds.add(id);
-    items.push({ id, display_name: name });
+    seenIds.add(trimmedId);
+    items.push({ id: trimmedId, display_name: name.trim() });
   }
 
   return { items };

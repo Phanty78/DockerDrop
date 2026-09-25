@@ -8,10 +8,6 @@ import { UnknownRecipientError } from "../../../src/backend/config/users.types";
 import type { UsersConfig } from "../../../src/backend/config/users.types";
 
 /**
- * Task 16.1 — RED stage.
- * `src/backend/config/recipient.ts` does not exist yet: every test below is expected
- * to fail (module resolution failure) until the module is implemented.
- *
  * Contract under test — pure functions over an in-memory `UsersConfig`:
  * - `findRecipient(config, recipientUserId): ColleagueUser | null`
  * - `ensureRecipientAllowed(config, recipientUserId): ColleagueUser`
