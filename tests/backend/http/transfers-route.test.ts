@@ -182,6 +182,9 @@ describe("postTransfersHandler", () => {
       get() {
         return null;
       },
+      update() {
+        throw new Error("boom-sentinel");
+      },
       list() {
         return [];
       },

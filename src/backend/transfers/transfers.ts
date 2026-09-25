@@ -1,24 +1,37 @@
 /**
- * Task 16.4 — `POST /transfers`: creation of a temporary transfer (architecture §9.3, §16.4).
+ * Tasks 16.4 + 16.6 — temporary transfers: `POST /transfers` creation (architecture
+ * §9.3, §16.4) and `PATCH /transfers/{transferId}` status changes through the
+ * centralized §8 state machine (§9.4, §16.6).
  *
  * The transfer state is temporary and in-memory only (no user, machine or transfer
  * persistent table — §8). `storage.upload` is minted by the injected
  * `S3UploadMechanism` port (task 16.5): the backend never relays the archive
  * binary, the source agent uploads straight to S3 with that descriptor.
+ *
+ * Since task 16.6 every status change goes through `applyTransferStatus`, which
+ * only accepts pairs allowed by `TRANSFER_TRANSITIONS` and fires the injected
+ * `TransferReadyNotifier` port exactly once per valid transition to "ready"
+ * (Google Chat lands behind it in task 16.8).
  */
 
 import { ensureRecipientAllowed } from "../config/recipient";
 import { UnknownRecipientError } from "../config/users.types";
 import {
   DEFAULT_RETENTION_MS,
+  TERMINAL_TRANSFER_STATUSES,
   TRANSFER_ID_PREFIX,
+  TRANSFER_TRANSITIONS,
   TransferError,
 } from "./transfers.types";
 import type {
+  ApplyTransferStatus,
+  ApplyTransferStatusDeps,
   CreateTransfer,
   CreateTransferDeps,
   CreateTransferResponse,
   TransferRecord,
+  TransferStatus,
+  TransferStatusChangeResponse,
   TransferStore,
 } from "./transfers.types";
 
@@ -37,6 +50,11 @@ export class InMemoryTransferStore implements TransferStore {
   list(): readonly TransferRecord[] {
     return [...this.records.values()];
   }
+
+  /** Replaces the record of the same id; the §8 state machine commits through this. */
+  update(record: TransferRecord): void {
+    this.records.set(record.id, record);
+  }
 }
 
 /** Human-readable description of a received value, used to make body errors loggable. */
@@ -50,24 +68,26 @@ function describeReceived(value: unknown): string {
 
 /**
  * Reads a non-blank, trimmed string field out of a parsed JSON object.
- * Throws `TransferError("TRANSFER_BODY_INVALID")` naming the field and the reason.
+ * Throws `TransferError("TRANSFER_BODY_INVALID")` naming the request, the field
+ * and the reason, so every refusal is loggable as-is.
  */
 function requireTrimmedString(
   body: Record<string, unknown>,
   field: string,
+  requestLabel: string,
 ): string {
   const value = body[field];
   if (typeof value !== "string") {
     throw new TransferError(
       "TRANSFER_BODY_INVALID",
-      `Invalid POST /transfers body: field "${field}" must be a string, received ${describeReceived(value)}.`,
+      `Invalid ${requestLabel} body: field "${field}" must be a string, received ${describeReceived(value)}.`,
     );
   }
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     throw new TransferError(
       "TRANSFER_BODY_INVALID",
-      `Invalid POST /transfers body: field "${field}" must not be blank, received ${JSON.stringify(value)}.`,
+      `Invalid ${requestLabel} body: field "${field}" must not be blank, received ${JSON.stringify(value)}.`,
     );
   }
   return trimmed;
@@ -94,8 +114,8 @@ export const createTransfer: CreateTransfer = (
   }
 
   const body = parsedBody as Record<string, unknown>;
-  const recipientUserId = requireTrimmedString(body, "recipient_user_id");
-  const sourceVolumeName = requireTrimmedString(body, "source_volume_name");
+  const recipientUserId = requireTrimmedString(body, "recipient_user_id", "POST /transfers");
+  const sourceVolumeName = requireTrimmedString(body, "source_volume_name", "POST /transfers");
 
   try {
     ensureRecipientAllowed(deps.users, recipientUserId);
@@ -133,5 +153,119 @@ export const createTransfer: CreateTransfer = (
     status: "created",
     storage: { upload },
     expires_at: expiresAt.toISOString(),
+  };
+};
+
+/** True when `value` is one of the eight §8 statuses; membership derives from the frozen transition map. */
+function isTransferStatus(value: string): value is TransferStatus {
+  return Object.hasOwn(TRANSFER_TRANSITIONS, value);
+}
+
+/**
+ * Validates a parsed PATCH /transfers/{transferId} body and applies the §8 state machine.
+ * See `ApplyTransferStatus` in ./transfers.types for the frozen contract.
+ */
+export const applyTransferStatus: ApplyTransferStatus = (
+  transferId: string,
+  parsedBody: unknown,
+  store: TransferStore,
+  deps: ApplyTransferStatusDeps,
+): TransferStatusChangeResponse => {
+  const requestLabel = `PATCH /transfers/${transferId}`;
+
+  if (
+    typeof parsedBody !== "object" ||
+    parsedBody === null ||
+    Array.isArray(parsedBody)
+  ) {
+    throw new TransferError(
+      "TRANSFER_BODY_INVALID",
+      `Invalid ${requestLabel} body: expected a JSON object with "status", received ${describeReceived(parsedBody)}.`,
+    );
+  }
+
+  const body = parsedBody as Record<string, unknown>;
+  const status = requireTrimmedString(body, "status", requestLabel);
+  if (!isTransferStatus(status)) {
+    throw new TransferError(
+      "TRANSFER_STATUS_UNKNOWN",
+      `Unknown transfer status ${JSON.stringify(status)} for transfer "${transferId}": expected one of ${Object.keys(TRANSFER_TRANSITIONS).join(", ")}.`,
+    );
+  }
+
+  const record = store.get(transferId);
+  if (record === null) {
+    throw new TransferError(
+      "TRANSFER_NOT_FOUND",
+      `Transfer "${transferId}" does not exist.`,
+    );
+  }
+
+  if (TERMINAL_TRANSFER_STATUSES.includes(record.status)) {
+    throw new TransferError(
+      "TRANSFER_TRANSITION_INVALID",
+      `Transfer "${transferId}" is in terminal status "${record.status}": no transition leaves a terminal status, received ${JSON.stringify(status)}.`,
+    );
+  }
+
+  // An elapsed retention window may only be closed by "expired": anything else is
+  // refused as expired, before the transition table is even consulted.
+  const now = deps.now?.() ?? new Date();
+  if (status !== "expired" && now.getTime() >= record.expiresAt.getTime()) {
+    throw new TransferError(
+      "TRANSFER_EXPIRED",
+      `Transfer "${transferId}" expired at ${record.expiresAt.toISOString()}: only status "expired" is still accepted, received ${JSON.stringify(status)}.`,
+    );
+  }
+
+  const allowed = TRANSFER_TRANSITIONS[record.status];
+  if (!allowed.includes(status)) {
+    throw new TransferError(
+      "TRANSFER_TRANSITION_INVALID",
+      `Invalid transition for transfer "${transferId}": "${record.status}" → ${JSON.stringify(status)} is not allowed by the §8 state machine (allowed from "${record.status}": ${allowed.join(", ")}).`,
+    );
+  }
+
+  // `archive_size` is optional: absent, the record keeps the size it already knows;
+  // present, it must be a non-negative integer number of bytes.
+  let archiveSize = record.archiveSize;
+  if (Object.hasOwn(body, "archive_size")) {
+    const value = body["archive_size"];
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+      const received = typeof value === "number" ? String(value) : describeReceived(value);
+      throw new TransferError(
+        "TRANSFER_BODY_INVALID",
+        `Invalid ${requestLabel} body: field "archive_size" must be a non-negative integer, received ${received}.`,
+      );
+    }
+    archiveSize = value;
+  }
+
+  const updated: TransferRecord = {
+    id: record.id,
+    recipientUserId: record.recipientUserId,
+    sourceVolumeName: record.sourceVolumeName,
+    status,
+    createdAt: record.createdAt,
+    expiresAt: record.expiresAt,
+  };
+  if (archiveSize !== undefined) {
+    updated.archiveSize = archiveSize;
+  }
+  store.update(updated);
+
+  // The ready-only port sees the committed record, once, after the commit (§16.6).
+  if (status === "ready") {
+    deps.notifier?.notifyReady(updated);
+  }
+
+  if (archiveSize === undefined) {
+    return { id: updated.id, status, expires_at: updated.expiresAt.toISOString() };
+  }
+  return {
+    id: updated.id,
+    status,
+    archive_size: archiveSize,
+    expires_at: updated.expiresAt.toISOString(),
   };
 };

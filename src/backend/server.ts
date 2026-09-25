@@ -1,7 +1,8 @@
 /**
- * Central backend entrypoint — tasks 16.1 + 16.4 + 16.5 wiring.
+ * Central backend entrypoint — tasks 16.1 + 16.4 + 16.5 + 16.6 wiring.
  * Serves `GET /users` from the colleagues configuration file and
- * `POST /transfers` creating temporary transfers (in-memory state only).
+ * `POST /transfers` creating temporary transfers, and applies the §8 state machine
+ * through `PATCH /transfers/{transferId}` (in-memory state only).
  *
  * Configuration:
  * - `USERS_CONFIG_PATH`: path to users.json (default: `data/users.json`).
@@ -16,9 +17,10 @@
  */
 import { loadUsersConfig } from "./config/users";
 import { getUsersHandler } from "./http/users.route";
-import { postTransfersHandler } from "./http/transfers.route";
+import { patchTransfersHandler, postTransfersHandler } from "./http/transfers.route";
 import { InMemoryTransferStore } from "./transfers/transfers";
 import { DEFAULT_RETENTION_MS } from "./transfers/transfers.types";
+import type { TransferReadyNotifier } from "./transfers/transfers.types";
 import { UsersConfigError } from "./config/users.types";
 import { createSigV4UploadMechanism, loadS3Config } from "./storage/s3";
 import type { S3PresignConfig } from "./storage/s3.types";
@@ -69,6 +71,16 @@ const config = await loadUsersConfig(configPath).catch((error: unknown) => {
 /** Temporary transfer state: in-memory only, the MVP imposes no persistent table (§16.4). */
 const transferStore = new InMemoryTransferStore();
 
+/**
+ * Ready port of §8/§16.6: one loggable line per valid transition to "ready", carrying the
+ * committed record. The Google Chat webhook lands behind this same port in task 16.8.
+ */
+const notifier: TransferReadyNotifier = {
+  notifyReady(record) {
+    console.log(`[transfer-ready] id=${record.id} volume=${record.sourceVolumeName} recipient=${record.recipientUserId} expires_at=${record.expiresAt.toISOString()}`);
+  },
+};
+
 Bun.serve({
   hostname: "127.0.0.1",
   port,
@@ -83,6 +95,25 @@ Bun.serve({
         { users: config, storage, retentionMs },
         transferStore,
       );
+    }
+    if (request.method === "PATCH" && url.pathname.startsWith("/transfers/")) {
+      // The id is a path segment, percent-decoded (any other decoding is the client's).
+      let transferId: string;
+      try {
+        transferId = decodeURIComponent(url.pathname.slice("/transfers/".length));
+      } catch {
+        // Malformed percent-encoding names no transfer: answer like any unknown path.
+        return new Response("Not Found", { status: 404 });
+      }
+      // A blank id is not a transfer id: fall through to the 404 below.
+      if (transferId.trim().length > 0) {
+        return patchTransfersHandler(
+          await request.text(),
+          transferId,
+          { notifier },
+          transferStore,
+        );
+      }
     }
     return new Response("Not Found", { status: 404 });
   },
