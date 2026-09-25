@@ -23,6 +23,7 @@ function invalidResponse(detail: string): DockerVolumesError {
 /**
  * Validates the parsed Engine body and maps its entries to `{ name, driver }` in Engine order.
  * `Volumes` null/undefined means the Engine holds no volume and yields an empty list.
+ * `Name`/`Driver` are trimmed before storage, matching the `.trim()` validation.
  */
 function parseVolumesResponse(parsed: unknown): VolumesResponse {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -57,7 +58,7 @@ function parseVolumesResponse(parsed: unknown): VolumesResponse {
       );
     }
 
-    items.push({ name: Name, driver: Driver });
+    items.push({ name: Name.trim(), driver: Driver.trim() });
   }
 
   return { items };

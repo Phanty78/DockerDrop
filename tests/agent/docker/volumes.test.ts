@@ -139,6 +139,17 @@ describe("listDockerVolumes", () => {
     });
   });
 
+  describe("normalisation", () => {
+    it("stocke les Name et Driver rembourrés en valeurs trimées", async () => {
+      const body = (await listDockerVolumes(
+        jsonTransport({ Volumes: [{ Name: "  mysql_client_x  ", Driver: " local " }] }),
+      )) as unknown as LooseVolumesBody;
+
+      expect(body).toEqual({ items: [{ name: "mysql_client_x", driver: "local" }] });
+      expect(Object.keys(body.items[0] ?? {})).toEqual(["name", "driver"]);
+    });
+  });
+
   describe("moteur sans volume", () => {
     it("retourne une liste vide quand le moteur répond Volumes: null", async () => {
       const body = (await listDockerVolumes(
