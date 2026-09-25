@@ -76,6 +76,24 @@ function hmacSha256(key: string | Uint8Array, value: string): Uint8Array {
 }
 
 /**
+ * Strict SigV4 URI encoding: every UTF-8 byte except `A-Z a-z 0-9 - _ . ~`
+ * becomes `%XY` (uppercase hex). The AWS documentation warns that the
+ * platform-standard encoders (e.g. `encodeURIComponent`, which leaves
+ * `! * ' ( )` raw) produce signatures that strictly canonicalizing S3
+ * gateways reject with 403 SignatureDoesNotMatch.
+ */
+function uriEncode(value: string): string {
+  let encoded = "";
+  for (const byte of new TextEncoder().encode(value)) {
+    const char = String.fromCharCode(byte);
+    encoded += /[A-Za-z0-9\-_.~]/.test(char)
+      ? char
+      : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return encoded;
+}
+
+/**
  * Builds the SigV4 query-presigned PUT mechanism of `config` (§9.3).
  * `now` is injectable so tests — and any future verification — can pin the
  * clock; every call is pure and synchronous, and errors propagate untouched.
@@ -84,15 +102,19 @@ export function createSigV4UploadMechanism(
   config: S3PresignConfig,
   now: () => Date = () => new Date(),
 ): S3UploadMechanism {
+  // Trailing slashes in S3_ENDPOINT (a frequent operator slip) would corrupt
+  // both the canonical host and the final URL (`…//docker-volume-transfers/…`),
+  // making every presigned descriptor unverifiable; normalize the base once.
+  const endpoint = config.endpoint.replace(/\/+$/, "");
   // Host header: the endpoint without its scheme (path-style virtual host).
-  const host = config.endpoint.replace(/^https?:\/\//i, "");
+  const host = endpoint.replace(/^https?:\/\//i, "");
 
   return {
     presignUpload(transferId: string, expiresAt: Date): string {
-      // Frozen key layout, URI-encoded segment by segment with `/` preserved.
+      // Frozen key layout, strictly URI-encoded segment by segment with `/` preserved.
       const encodedKey = volumeArchiveKey(transferId)
         .split("/")
-        .map((segment) => encodeURIComponent(segment))
+        .map(uriEncode)
         .join("/");
       const objectPath = `/${config.bucket}/${encodedKey}`;
 
@@ -114,7 +136,7 @@ export function createSigV4UploadMechanism(
       // Signed query parameters, in the sorted order SigV4 canonicalization requires.
       const canonicalQuery = [
         `X-Amz-Algorithm=${ALGORITHM}`,
-        `X-Amz-Credential=${encodeURIComponent(`${config.accessKeyId}/${credentialScope}`)}`,
+        `X-Amz-Credential=${uriEncode(`${config.accessKeyId}/${credentialScope}`)}`,
         `X-Amz-Date=${amzdate}`,
         `X-Amz-Expires=${expiresSeconds}`,
         `X-Amz-SignedHeaders=${SIGNED_HEADERS}`,
@@ -145,7 +167,7 @@ export function createSigV4UploadMechanism(
         .update(stringToSign, "utf8")
         .digest("hex");
 
-      return `${config.endpoint}${objectPath}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+      return `${endpoint}${objectPath}?${canonicalQuery}&X-Amz-Signature=${signature}`;
     },
   };
 }

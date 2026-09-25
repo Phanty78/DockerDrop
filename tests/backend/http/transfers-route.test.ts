@@ -111,8 +111,9 @@ describe("postTransfersHandler", () => {
 
   it("refuse le binaire de l'archive comme payload de transfert", async () => {
     const store = new InMemoryTransferStore();
-    // A raw archive binary (NUL bytes + non-UTF-8 tail) is not valid JSON: it must be
-    // refused before any transfer record or S3 descriptor exists (§16.5 bullet 5).
+    // A raw archive binary (leading control bytes) is not valid JSON: whatever
+    // the bytes that follow, it must be refused before any transfer record or
+    // S3 descriptor exists (§16.5 bullet 5).
     const binaryRawBody = String.fromCharCode(0, 1, 2, 3) + "\u00e9tar\u2026";
 
     const response = postTransfersHandler(binaryRawBody, DEPS, store);

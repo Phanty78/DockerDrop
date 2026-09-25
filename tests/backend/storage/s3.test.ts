@@ -50,10 +50,8 @@ const config: S3PresignConfig = {
   secretAccessKey: "secret/access+key",
 };
 
-/** `20260924/eu-west-1/s3/aws4_request`, URI-encoded as it appears in the URL. */
-const encodedCredential = encodeURIComponent(
-  `${config.accessKeyId}/20260924/${config.region}/s3/aws4_request`,
-);
+/** Strictly SigV4-encoded credential scope (`/` → `%2F`), as it appears in the URL. */
+const encodedCredential = "AKIAEXAMPLEACCESSKEYID%2F20260924%2Feu-west-1%2Fs3%2Faws4_request";
 
 /** Expected path-style object URL prefix, minus the signed query. */
 const OBJECT_URL_PREFIX = `${config.endpoint}/${config.bucket}/docker-volume-transfers/tr_x/volume.tar.zst?`;
@@ -225,5 +223,35 @@ describe("createSigV4UploadMechanism", () => {
       "X-Amz-SignedHeaders",
       "X-Amz-Signature",
     ]);
+  });
+
+  it("normalise une barre oblique finale dans l'endpoint", () => {
+    const expiresAt = new Date(FIXED_NOW.getTime() + DAY_MS);
+    const sloppy = createSigV4UploadMechanism(
+      { ...config, endpoint: "https://s3.example.com//" },
+      () => FIXED_NOW,
+    );
+
+    // Same host, same path, same signature: the descriptor derived from the
+    // sloppy endpoint is bit-identical to the clean-endpoint one.
+    expect(sloppy.presignUpload("tr_x", expiresAt)).toBe(
+      mechanism.presignUpload("tr_x", expiresAt),
+    );
+  });
+
+  it("encode strictement les octets non réservés au sens SigV4", () => {
+    // Symbolic access keys (MinIO/Garage style) may carry sub-delims that
+    // `encodeURIComponent` leaves raw (`! * ' ( )`).
+    const symbolic = createSigV4UploadMechanism(
+      { ...config, accessKeyId: "AKIA*KEY!'()" },
+      () => FIXED_NOW,
+    );
+
+    const url = symbolic.presignUpload("tr_x", new Date(FIXED_NOW.getTime() + DAY_MS));
+
+    expect(url).toContain("X-Amz-Credential=AKIA%2AKEY%21%27%28%29%2F20260924");
+    expect(url).not.toContain("*");
+    expect(url).not.toContain("'");
+    expect(url).not.toContain("(");
   });
 });
