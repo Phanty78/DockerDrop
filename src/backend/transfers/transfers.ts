@@ -2,15 +2,15 @@
  * Task 16.4 — `POST /transfers`: creation of a temporary transfer (architecture §9.3, §16.4).
  *
  * The transfer state is temporary and in-memory only (no user, machine or transfer
- * persistent table — §8). `storage.upload` is a placeholder until task 16.5 provides
- * the real temporary S3 upload mechanism.
+ * persistent table — §8). `storage.upload` is minted by the injected
+ * `S3UploadMechanism` port (task 16.5): the backend never relays the archive
+ * binary, the source agent uploads straight to S3 with that descriptor.
  */
 
 import { ensureRecipientAllowed } from "../config/recipient";
 import { UnknownRecipientError } from "../config/users.types";
 import {
   DEFAULT_RETENTION_MS,
-  DEFAULT_UPLOAD_DESCRIPTOR,
   TRANSFER_ID_PREFIX,
   TransferError,
 } from "./transfers.types";
@@ -113,8 +113,13 @@ export const createTransfer: CreateTransfer = (
   const retentionMs = deps.retentionMs ?? DEFAULT_RETENTION_MS;
   const expiresAt = new Date(createdAt.getTime() + retentionMs);
 
+  const id = `${TRANSFER_ID_PREFIX}${crypto.randomUUID()}`;
+  // Minted before the record is stored: a mechanism failure must leave the store empty.
+  // Anything it throws propagates untouched (the route answers 500 for non-TransferError).
+  const upload = deps.storage.presignUpload(id, expiresAt);
+
   const record: TransferRecord = {
-    id: `${TRANSFER_ID_PREFIX}${crypto.randomUUID()}`,
+    id,
     recipientUserId,
     sourceVolumeName,
     status: "created",
@@ -126,7 +131,7 @@ export const createTransfer: CreateTransfer = (
   return {
     id: record.id,
     status: "created",
-    storage: { upload: deps.uploadDescriptor ?? DEFAULT_UPLOAD_DESCRIPTOR },
+    storage: { upload },
     expires_at: expiresAt.toISOString(),
   };
 };

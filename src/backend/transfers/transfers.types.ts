@@ -5,11 +5,13 @@
  *   → 201 { "id": "tr_…", "status": "created", "storage": { "upload": "…" }, "expires_at": "<ISO-8601>" }
  *
  * The transfer state is temporary and in-memory only: the MVP imposes no user,
- * machine or transfer persistent table (§8, §16.4). The real temporary S3 upload
- * mechanism belongs to task 16.5; `storage.upload` is a replaceable placeholder here.
+ * machine or transfer persistent table (§8, §16.4). Since task 16.5,
+ * `storage.upload` is the temporary S3 upload mechanism minted per transfer
+ * by the injectable `S3UploadMechanism` port (src/backend/storage/s3.types.ts).
  */
 
 import type { UsersConfig } from "../config/users.types";
+import type { S3UploadMechanism } from "../storage/s3.types";
 
 /** Transfer statuses of the §8 lifecycle; task 16.4 only ever produces "created". */
 export type TransferStatus =
@@ -66,21 +68,19 @@ export const TRANSFER_ID_PREFIX = "tr_";
 /** Default retention (24 h) used to compute `expires_at`; overridable via deps or deployment. */
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-/** Placeholder returned as `storage.upload` until task 16.5 provides the real s3-node mechanism. */
-export const DEFAULT_UPLOAD_DESCRIPTOR = "temporary-upload-mechanism";
-
 /**
  * Deps of `createTransfer`.
  * - `users`: colleagues configuration used to refuse an unknown recipient (task 16.1 helper).
+ * - `storage`: port minting the temporary `storage.upload` descriptor for the
+ *   transfer's single S3 object (task 16.5).
  * - `retentionMs`: retention duration; defaults to DEFAULT_RETENTION_MS.
  * - `now`: injectable clock so tests can freeze `expires_at` deterministically.
- * - `uploadDescriptor`: value returned as `storage.upload`; defaults to DEFAULT_UPLOAD_DESCRIPTOR.
  */
 export interface CreateTransferDeps {
   users: UsersConfig;
+  storage: S3UploadMechanism;
   retentionMs?: number;
   now?: () => Date;
-  uploadDescriptor?: string;
 }
 
 /**

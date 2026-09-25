@@ -1,20 +1,18 @@
 import { describe, expect, it } from "bun:test";
 
 import { createTransfer, InMemoryTransferStore } from "../../../src/backend/transfers/transfers";
-import {
-  DEFAULT_RETENTION_MS,
-  DEFAULT_UPLOAD_DESCRIPTOR,
-  TransferError,
-} from "../../../src/backend/transfers/transfers.types";
+import { DEFAULT_RETENTION_MS, TransferError } from "../../../src/backend/transfers/transfers.types";
 import type {
   CreateTransferDeps,
   TransferRecord,
 } from "../../../src/backend/transfers/transfers.types";
+import type { S3UploadMechanism } from "../../../src/backend/storage/s3.types";
 
 /**
- * Contract under test (task 16.4, architecture §9.3):
+ * Contract under test (task 16.4/16.5, architecture §9.3):
  * `createTransfer(parsedBody, deps, store)` validates a parsed POST /transfers body,
- * refuses an unknown recipient, builds an in-memory `TransferRecord` and returns
+ * refuses an unknown recipient, mints `storage.upload` through the injected
+ * `S3UploadMechanism` port, builds an in-memory `TransferRecord` and returns
  * exactly `{ id, status: "created", storage: { upload }, expires_at }`.
  * No state is persisted: the store is the only state, and it is plain in-memory.
  */
@@ -25,7 +23,16 @@ const knownConfig: { items: Array<{ id: string; display_name: string }> } = {
 
 const FIXED_NOW = new Date("2026-09-24T15:30:00.000Z");
 const ONE_HOUR_MS = 3_600_000;
-const UPLOAD_DESCRIPTOR = "s3://dockerdrop-temporary/upload-descriptor";
+
+/**
+ * Deterministic fake S3 port: the descriptor is derived from the transfer id and
+ * the expiration only — the mechanism never sees the volume name, exactly like
+ * the real presigner which addresses `docker-volume-transfers/{transferId}/…`.
+ */
+const fakeUploadMechanism: S3UploadMechanism = {
+  presignUpload: (transferId, expiresAt) =>
+    `fake-upload://${transferId}@${expiresAt.toISOString()}`,
+};
 
 const validBody = {
   recipient_user_id: "thomas",
@@ -55,9 +62,9 @@ function expectTransferError(error: unknown, code: TransferError["code"]): Trans
 function deps(overrides: Partial<CreateTransferDeps> = {}): CreateTransferDeps {
   return {
     users: knownConfig,
+    storage: fakeUploadMechanism,
     now: () => FIXED_NOW,
     retentionMs: ONE_HOUR_MS,
-    uploadDescriptor: UPLOAD_DESCRIPTOR,
     ...overrides,
   };
 }
@@ -100,12 +107,14 @@ describe("createTransfer", () => {
 
     expect(response.status).toBe("created");
     expect(response.id).toMatch(/^tr_[0-9a-f-]{36}$/);
-    expect(response.storage).toEqual({ upload: UPLOAD_DESCRIPTOR });
+    expect(response.storage).toEqual({
+      upload: `fake-upload://${response.id}@2026-09-24T16:30:00.000Z`,
+    });
     expect(response.expires_at).toBe("2026-09-24T16:30:00.000Z");
     expect(response).toEqual({
       id: response.id,
       status: "created",
-      storage: { upload: UPLOAD_DESCRIPTOR },
+      storage: { upload: `fake-upload://${response.id}@2026-09-24T16:30:00.000Z` },
       expires_at: "2026-09-24T16:30:00.000Z",
     });
     // No extra top-level key, no extra `storage` key.
@@ -170,12 +179,60 @@ describe("createTransfer", () => {
     expect(store.get(response.id)?.expiresAt).toEqual(expected);
   });
 
-  it("utilise le descripteur d'upload par défaut quand aucun n'est fourni", () => {
+  it("confie le mécanisme d'upload au port S3 avec l'id et l'expiration du transfert", () => {
+    const store = new InMemoryTransferStore();
+    const calls: Array<{ transferId: string; expiresAt: Date }> = [];
+    const recordingMechanism: S3UploadMechanism = {
+      presignUpload: (transferId, expiresAt) => {
+        calls.push({ transferId, expiresAt });
+        return `fake-upload://${transferId}@${expiresAt.toISOString()}`;
+      },
+    };
+
+    const response = createTransfer(validBody, deps({ storage: recordingMechanism }), store);
+
+    // The port was called once, with the transfer's own id and the computed expiration.
+    expect(calls).toEqual([{ transferId: response.id, expiresAt: new Date(response.expires_at) }]);
+    // The descriptor carries that id and that ISO expiration, nothing else.
+    expect(response.storage.upload).toBe(`fake-upload://${response.id}@${response.expires_at}`);
+    expect(response.storage.upload).toBe(`fake-upload://${response.id}@2026-09-24T16:30:00.000Z`);
+    expect(store.get(response.id)?.expiresAt).toEqual(new Date(response.expires_at));
+  });
+
+  it("dérive des descripteurs distincts pour deux transferts du même volume", () => {
     const store = new InMemoryTransferStore();
 
-    const response = createTransfer(validBody, deps({ uploadDescriptor: undefined }), store);
+    const first = createTransfer(validBody, deps(), store);
+    const second = createTransfer(validBody, deps(), store);
 
-    expect(response.storage).toEqual({ upload: DEFAULT_UPLOAD_DESCRIPTOR });
+    expect(first.id).not.toBe(second.id);
+    expect(first.storage.upload).not.toBe(second.storage.upload);
+    expect(first.storage.upload).toContain(first.id);
+    expect(second.storage.upload).toContain(second.id);
+    // The mechanism never sees the volume name, so no descriptor may leak it.
+    expect(first.storage.upload).not.toContain("mysql_client_x");
+    expect(second.storage.upload).not.toContain("mysql_client_x");
+    expect(store.list()).toHaveLength(2);
+  });
+
+  it("laisse le store vide quand le mécanisme d'upload échoue", () => {
+    const store = new InMemoryTransferStore();
+    const failingMechanism: S3UploadMechanism = {
+      presignUpload: () => {
+        throw new Error("boom-sentinel");
+      },
+    };
+
+    const error = captureThrown(() =>
+      createTransfer(validBody, deps({ storage: failingMechanism }), store),
+    );
+
+    // Not a TransferError: the failure is propagated as-is (the route answers 500).
+    expect(error).not.toBeInstanceOf(TransferError);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).name).toBe("Error");
+    expect((error as Error).message).toBe("boom-sentinel");
+    expect(store.list()).toEqual([]);
   });
 
   it("nettoie les espaces autour du destinataire et du nom de volume", () => {
