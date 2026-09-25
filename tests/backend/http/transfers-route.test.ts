@@ -109,6 +109,7 @@ describe("postTransfersHandler", () => {
     );
 
     expect(response.status).toBe(400);
+    expect(response.headers.get("content-type") ?? "").toContain("application/json");
 
     const body = (await response.json()) as TransferErrorBody;
 
@@ -129,6 +130,7 @@ describe("postTransfersHandler", () => {
     );
 
     expect(response.status).toBe(422);
+    expect(response.headers.get("content-type") ?? "").toContain("application/json");
 
     const body = (await response.json()) as TransferErrorBody;
 

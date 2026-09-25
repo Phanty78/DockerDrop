@@ -23,6 +23,13 @@ const port = Number(process.env.PORT ?? 8787);
 const retentionMs = process.env.TRANSFER_RETENTION_MS
   ? Number(process.env.TRANSFER_RETENTION_MS)
   : DEFAULT_RETENTION_MS;
+if (!Number.isFinite(retentionMs) || retentionMs <= 0) {
+  console.error(
+    `[server] invalid TRANSFER_RETENTION_MS: ${JSON.stringify(process.env.TRANSFER_RETENTION_MS)} ` +
+      `(expected a positive number of milliseconds, default ${DEFAULT_RETENTION_MS})`,
+  );
+  process.exit(1);
+}
 
 const config = await loadUsersConfig(configPath).catch((error: unknown) => {
   if (error instanceof UsersConfigError) {
@@ -54,6 +61,12 @@ Bun.serve({
       );
     }
     return new Response("Not Found", { status: 404 });
+  },
+  // Unexpected failures must never serve Bun's dev error page (stack, source, cwd):
+  // log server-side and answer an opaque 500.
+  error(error) {
+    console.error("[server] unexpected failure:", error);
+    return new Response("Internal Server Error", { status: 500 });
   },
 });
 

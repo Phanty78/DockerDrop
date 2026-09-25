@@ -22,12 +22,6 @@ export type TransferStatus =
   | "failed"
   | "expired";
 
-/** POST /transfers request body (field names are part of the HTTP contract). */
-export interface CreateTransferRequest {
-  recipient_user_id: string;
-  source_volume_name: string;
-}
-
 /** POST /transfers 201 response body; keys are frozen by §9.3 (no extra field). */
 export interface CreateTransferResponse {
   id: string;
