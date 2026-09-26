@@ -16,6 +16,7 @@ import {
   SourceTransferError,
   type CreateTransferRequest,
   type CreatedTransferDescriptor,
+  type FetchLike,
   type SourceTransferClient,
   type SourceTransferStatus,
 } from "./source-transfer.types";
@@ -25,6 +26,14 @@ const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" } as co
 
 /** Maximum length of a response body excerpt kept in an error message, so logs stay readable. */
 const BODY_EXCERPT_LENGTH = 200;
+
+/**
+ * Default deadline of one agent→backend JSON request. These requests are tiny and the backend sits
+ * on the LAN, so 10 s is already generous: past that the backend is silent and the transfer must
+ * fail explicitly instead of hanging forever. Injectable through `createHttpTransferClient` so
+ * tests can shorten it.
+ */
+const DEFAULT_TIMEOUT_MS = 10_000;
 
 /** The two failure codes this client may raise; never a bare fetch error. */
 type ClientErrorCode = "TRANSFER_CREATE_FAILED" | "TRANSFER_STATUS_UPDATE_FAILED";
@@ -106,27 +115,44 @@ async function readBodyText(response: Response): Promise<string | null> {
  * straight to S3 by the caller.
  *
  * The base URL is normalized once (trailing slashes stripped) so a sloppy configuration cannot
- * produce a `…//transfers` request. `fetchImpl` is injectable so tests can force transport failures;
- * it defaults to the global `fetch`.
+ * produce a `…//transfers` request. Every request carries a `timeoutMs` deadline (`AbortSignal`),
+ * so a backend that never answers surfaces a `timed out after Nms` failure instead of hanging the
+ * transfer, and `redirect: "error"`, so a 3xx is never followed into a false success. `fetchImpl`
+ * and `timeoutMs` are injectable so tests can force transport failures without waiting.
  */
 export function createHttpTransferClient(
   baseUrl: string,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
 ): SourceTransferClient {
   // Trailing slashes are stripped once so a sloppy base URL never yields a `…//transfers` request.
   const base = baseUrl.replace(/\/+$/, "");
 
-  /** Sends one JSON request; a transport throw becomes the given explicit failure code. */
+  /** Sends one JSON request; a transport throw or timeout becomes the given explicit failure code. */
   async function send(
     url: string,
     method: "POST" | "PATCH",
     payload: string,
     code: ClientErrorCode,
   ): Promise<Response> {
+    const signal = AbortSignal.timeout(timeoutMs);
+
     try {
-      return await fetchImpl(url, { method, headers: JSON_HEADERS, body: payload });
+      return await fetchImpl(url, {
+        method,
+        headers: JSON_HEADERS,
+        body: payload,
+        redirect: "error",
+        signal,
+      });
     } catch (error) {
-      throw new SourceTransferError(code, `${method} ${url} failed: ${describeFailure(error)}`);
+      // A timeout rejects with a runtime-specific error, so the configured delay is named
+      // explicitly: a silent backend must be diagnosable from the error message alone.
+      const cause = signal.aborted
+        ? `timed out after ${timeoutMs}ms (${describeFailure(error)})`
+        : describeFailure(error);
+
+      throw new SourceTransferError(code, `${method} ${url} failed: ${cause}`);
     }
   }
 

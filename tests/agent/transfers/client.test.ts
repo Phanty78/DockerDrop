@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { createHttpTransferClient } from "../../../src/agent/transfers/client";
 import {
   SourceTransferError,
+  type FetchLike,
   type SourceTransferErrorCode,
   type SourceTransferStatus,
 } from "../../../src/agent/transfers/source-transfer.types";
@@ -84,12 +85,16 @@ function startFakeBackend(respond: FakeResponder): FakeBackend {
 }
 
 /** Backend answering `status`/`body` to everything, for refusal and malformed-body scenarios. */
-function startStaticBackend(status: number, body: string): FakeBackend {
+function startStaticBackend(
+  status: number,
+  body: string,
+  contentType = "application/json; charset=utf-8",
+): FakeBackend {
   return startFakeBackend(
     () =>
       new Response(body, {
         status,
-        headers: { "content-type": "application/json; charset=utf-8" },
+        headers: { "content-type": contentType },
       }),
   );
 }
@@ -163,6 +168,27 @@ async function captureTransferError(
   expect(error.message.length).toBeGreaterThan(0);
 
   return error;
+}
+
+/**
+ * Races `promise` against a short wall-clock deadline so a client that ignores its `AbortSignal`
+ * fails the test fast instead of leaving the suite hanging; the guard timer is always cleared.
+ *
+ * Real timers are required here: the guard must race the native `AbortSignal.timeout` firing
+ * inside the client, which fake timers cannot drive. The guarded call normally settles on the
+ * client deadline (50 ms) and the guard timer is cleared right after, so the suite never waits
+ * for `ms`.
+ */
+function withFailureGuard<T>(promise: Promise<T>, ms: number): Promise<T> {
+  const { promise: guard, reject } = Promise.withResolvers<never>();
+  const timer = setTimeout(
+    () => reject(new Error(`test guard: promise still pending after ${ms}ms`)),
+    ms,
+  );
+
+  return Promise.race([promise, guard]).finally(() => {
+    clearTimeout(timer);
+  });
 }
 
 describe("createHttpTransferClient", () => {
@@ -299,7 +325,7 @@ describe("createHttpTransferClient", () => {
   });
 
   it("remonte l'échec réseau comme une erreur explicite", async () => {
-    const failingFetch = (() => Promise.reject(new Error("ECONNREFUSED"))) as unknown as typeof fetch;
+    const failingFetch: FetchLike = () => Promise.reject(new Error("ECONNREFUSED"));
     const client = createHttpTransferClient("http://127.0.0.1:1", failingFetch);
 
     const createError = await captureTransferError(
@@ -335,5 +361,90 @@ describe("createHttpTransferClient", () => {
       "/transfers",
       "/transfers",
     ]);
+  });
+
+  it("n'attend pas indéfiniment un backend muet", async () => {
+    // Backend that accepts the connection but never answers: it settles only when the client's
+    // AbortSignal fires, proving each request carries a deadline instead of hanging forever.
+    const hangingFetch: FetchLike = (_input, init) => {
+      const { promise, reject } = Promise.withResolvers<Response>();
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+
+      return promise;
+    };
+    const client = createHttpTransferClient("http://127.0.0.1:1", hangingFetch, 50);
+
+    const startedAt = Date.now();
+    const error = await captureTransferError(
+      withFailureGuard(
+        client.createTransfer({ recipientUserId: "thomas", volumeName: "mysql_client_x" }),
+        1_000,
+      ),
+      "TRANSFER_CREATE_FAILED",
+    );
+
+    expect(error.message).toContain("timed out after 50ms");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it("refuse une redirection au lieu de la suivre", async () => {
+    // The redirect target answers 201 with the §9.3 body: following the 3xx would look like a
+    // success while the real backend never applied the POST.
+    const backend = startFakeBackend((_request, recorded) =>
+      recorded.method === "POST" && recorded.pathname === "/transfers"
+        ? new Response(null, { status: 302, headers: { location: "/transfers-followed" } })
+        : Response.json(CREATED_BODY, { status: 201 }),
+    );
+    const client = createHttpTransferClient(backend.baseUrl);
+
+    const error = await captureTransferError(
+      client.createTransfer({ recipientUserId: "thomas", volumeName: "mysql_client_x" }),
+      "TRANSFER_CREATE_FAILED",
+    );
+
+    expect(error.message).toContain("POST");
+    expect(error.message).toContain("/transfers");
+    // Only the original POST was issued: the 3xx was refused, never followed.
+    expect(backend.requests.map((request) => request.pathname)).toEqual(["/transfers"]);
+  });
+
+  it("remonte un refus en texte brut avec le statut et l'extrait du corps", async () => {
+    // The backend answers bare text — a crash ("500 Internal Server Error") or an unknown route
+    // (plain 404) — so there is no `{ error: { code, message } }` object to parse: the excerpt
+    // fallback must still make the refusal diagnosable from the message alone.
+    const scenarios: readonly {
+      readonly status: number;
+      readonly body: string;
+      readonly mentions: readonly string[];
+    }[] = [
+      {
+        status: 500,
+        body: "Internal Server Error",
+        mentions: ["500", "Internal Server Error"],
+      },
+      {
+        status: 404,
+        body: "plain-text refusal: transfer endpoint missing",
+        mentions: ["404", "transfer endpoint missing"],
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const backend = startStaticBackend(
+        scenario.status,
+        scenario.body,
+        "text/plain; charset=utf-8",
+      );
+      const client = createHttpTransferClient(backend.baseUrl);
+
+      const error = await captureTransferError(
+        client.createTransfer({ recipientUserId: "thomas", volumeName: "mysql_client_x" }),
+        "TRANSFER_CREATE_FAILED",
+      );
+
+      for (const mention of scenario.mentions) {
+        expect(error.message).toContain(mention);
+      }
+    }
   });
 });

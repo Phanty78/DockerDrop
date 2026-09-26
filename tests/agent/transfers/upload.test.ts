@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { uploadArchiveToS3 } from "../../../src/agent/transfers/upload";
 import { SourceTransferError } from "../../../src/agent/transfers/source-transfer.types";
 import type {
+  FetchLike,
   SourceTransferErrorCode,
   UploadArchiveDeps,
 } from "../../../src/agent/transfers/source-transfer.types";
@@ -14,9 +15,11 @@ import type {
 /**
  * Contract under test: `uploadArchiveToS3` PUTs the archive at `archivePath` directly to the
  * presigned URL. The binary goes to S3 only, streamed through a counting `TransformStream` that
- * reports progress per chunk without ever reading the archive fully into memory; the returned
- * `uploadedBytes` is the exact file size, and every failure rejects with an explicit
- * `SourceTransferError` instead of a false success. `fetchImpl` is faked: no network is contacted.
+ * reports progress per chunk without ever reading the archive fully into memory, the last call
+ * being `(total, total)` — `(0, 0)` for an empty archive. The PUT declares the exact file size as
+ * `Content-Length`, never asking for chunked framing, and the returned `uploadedBytes` is that
+ * exact size; every failure rejects with an explicit `SourceTransferError` instead of a false
+ * success. `fetchImpl` is faked: no network is contacted.
  */
 
 /**
@@ -105,11 +108,13 @@ interface CapturedUpload {
   readonly method: string | undefined;
   /** True when `init.body` was a `ReadableStream`, i.e. the archive was streamed, not buffered. */
   readonly bodyIsStream: boolean;
+  /** Raw `init.headers` the uploader declared; `undefined` when it declared none. */
+  readonly headers: HeadersInit | undefined;
   readonly bodyBytes: Uint8Array;
 }
 
 /** Request URL of the fetch input, whichever shape the uploader passes. */
-function requestUrl(input: RequestInfo | URL): string {
+function requestUrl(input: string | URL | Request): string {
   if (typeof input === "string") {
     return input;
   }
@@ -155,22 +160,26 @@ async function collectStream(stream: ReadableStream<Uint8Array>): Promise<Uint8A
  * to S3 and how the uploader maps the answer.
  */
 function capturingFetch(respond: () => Response): {
-  readonly fetchImpl: typeof fetch;
+  readonly fetchImpl: FetchLike;
   readonly uploads: CapturedUpload[];
 } {
   const uploads: CapturedUpload[] = [];
 
-  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const fetchImpl: FetchLike = async (input, init) => {
     const body = init?.body;
     const bodyIsStream = body instanceof ReadableStream;
-    const bodyBytes = bodyIsStream
-      ? await collectStream(body as ReadableStream<Uint8Array>)
-      : new Uint8Array(0);
+    const bodyBytes = bodyIsStream ? await collectStream(body) : new Uint8Array(0);
 
-    uploads.push({ url: requestUrl(input), method: init?.method, bodyIsStream, bodyBytes });
+    uploads.push({
+      url: requestUrl(input),
+      method: init?.method,
+      bodyIsStream,
+      headers: init?.headers,
+      bodyBytes,
+    });
 
     return respond();
-  }) as typeof fetch;
+  };
 
   return { fetchImpl, uploads };
 }
@@ -212,6 +221,13 @@ describe("uploadArchiveToS3", () => {
       // The archive must reach S3 as a stream, not as a buffered blob or byte array.
       expect(upload.bodyIsStream).toBe(true);
       expectSameBytes(upload.bodyBytes, bytes);
+
+      // Real S3 answers 411 MissingContentLength to a chunked PUT, so the exact size must be
+      // declared; without it a body stream ending early would also be stored truncated.
+      const requestHeaders = new Headers(upload.headers);
+      expect(requestHeaders.get("Content-Length")).toBe(String(bytes.length));
+      // The uploader declares the size itself instead of asking for chunked framing.
+      expect(requestHeaders.get("transfer-encoding")).toBeNull();
       expect(result).toEqual({ uploadedBytes: bytes.length });
     });
   });
@@ -240,6 +256,26 @@ describe("uploadArchiveToS3", () => {
       expect(previousBytes).toBe(bytes.length);
       expect(progress.at(-1)).toEqual([bytes.length, bytes.length]);
       expect(result).toEqual({ uploadedBytes: bytes.length });
+    });
+  });
+
+  it("remonte la progression pour une archive vide", async () => {
+    await withArchiveFixture(0, async (archivePath) => {
+      const progress: Array<readonly [number, number]> = [];
+      const { fetchImpl, uploads } = capturingFetch(() => new Response(null, { status: 200 }));
+
+      const result = await uploadArchiveToS3(archivePath, UPLOAD_URL, {
+        fetchImpl,
+        onProgress: (bytesUploaded, totalBytes) => progress.push([bytesUploaded, totalBytes]),
+      });
+
+      const upload = onlyUpload(uploads);
+      // No chunk ever crosses the counting stream for an empty archive, so the contract's final
+      // `(total, total)` call must be emitted explicitly and exactly once.
+      expect(progress).toEqual([[0, 0]]);
+      expectSameBytes(upload.bodyBytes, new Uint8Array(0));
+      expect(new Headers(upload.headers).get("Content-Length")).toBe("0");
+      expect(result).toEqual({ uploadedBytes: 0 });
     });
   });
 
@@ -286,6 +322,37 @@ describe("uploadArchiveToS3", () => {
 
       onlyUpload(uploads);
       expect(error.message).toContain("ECONNREFUSED");
+    });
+  });
+
+  it("refuse un faux succès si le flux s'interrompt en cours d'upload", async () => {
+    await withArchiveFixture(FIXTURE_SIZE, async (archivePath) => {
+      let consumedFirstChunk = false;
+
+      const brokenFetch: FetchLike = async (_input, init) => {
+        const stream = init?.body;
+
+        if (stream instanceof ReadableStream) {
+          // Start draining, like a transport that already sent the beginning of the body…
+          await stream.getReader().read();
+          consumedFirstChunk = true;
+        }
+
+        // …then the connection breaks before the whole archive made it through.
+        throw new Error("stream-broken");
+      };
+
+      const error = await captureUploadError(
+        archivePath,
+        UPLOAD_URL,
+        { fetchImpl: brokenFetch },
+        "S3_UPLOAD_REQUEST_FAILED",
+      );
+
+      // The failure struck mid-upload, after bytes had already been streamed out…
+      expect(consumedFirstChunk).toBe(true);
+      // …and the transport error stays in the message instead of a false success.
+      expect(error.message).toContain("stream-broken");
     });
   });
 

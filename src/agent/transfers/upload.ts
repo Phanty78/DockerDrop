@@ -4,15 +4,17 @@
  * `uploadArchiveToS3` PUTs the finished archive straight to the temporary presigned URL: the binary
  * goes to S3 only, the backend never transports it. The file streams through a counting
  * `TransformStream`, so the archive is never fully read into memory and progress is reported per
- * chunk, the last call being exactly `(totalBytes, totalBytes)`. Every failure is an explicit,
- * loggable `SourceTransferError`: `S3_UPLOAD_REQUEST_FAILED` for a missing/unreadable archive or a
- * failed PUT transport, `S3_UPLOAD_REJECTED` for a non-2xx S3 answer (status, statusText and the
- * first characters of the S3 body kept for logs). `uploadedBytes` is returned only after a 2xx
- * answer, so no false success is ever reported.
+ * chunk, the last call being exactly `(totalBytes, totalBytes)`. The PUT declares that exact size
+ * as `Content-Length` — real S3 answers 411 to a chunked PUT, and a short body then fails loudly
+ * instead of being stored truncated — and an empty archive still receives the final `(0, 0)` call.
+ * Every failure is an explicit, loggable `SourceTransferError`: `S3_UPLOAD_REQUEST_FAILED` for a
+ * missing/unreadable archive or a failed PUT transport, `S3_UPLOAD_REJECTED` for a non-2xx S3
+ * answer (status, statusText and the first characters of the S3 body kept for logs).
+ * `uploadedBytes` is returned only after a 2xx answer, so no false success is ever reported.
  */
 
 import { SourceTransferError } from "./source-transfer.types";
-import type { UploadArchiveToS3 } from "./source-transfer.types";
+import type { FetchLike, UploadArchiveToS3 } from "./source-transfer.types";
 
 /** Characters of an S3 error body kept in the message; enough to carry SignatureDoesNotMatch. */
 const RESPONSE_DETAIL_LIMIT = 200;
@@ -71,6 +73,12 @@ export const uploadArchiveToS3: UploadArchiveToS3 = async (archivePath, uploadUr
   const onProgress = deps?.onProgress;
   let bytesUploaded = 0;
 
+  if (totalBytes === 0) {
+    // An empty archive crosses the counting stream as zero chunks, so the contract's final
+    // `(total, total)` call cannot come from the transform and is emitted explicitly here.
+    onProgress?.(0, 0);
+  }
+
   // Counting wrapper: fetch pulls the archive through it, every chunk advances the cumulative
   // count, and `bytesUploaded` ends at exactly `totalBytes` after the last chunk.
   const body = file.stream().pipeThrough(
@@ -83,11 +91,18 @@ export const uploadArchiveToS3: UploadArchiveToS3 = async (archivePath, uploadUr
     }),
   );
 
-  const fetchImpl = deps?.fetchImpl ?? fetch;
+  const fetchImpl: FetchLike = deps?.fetchImpl ?? fetch;
 
   let response: Response;
   try {
-    response = await fetchImpl(uploadUrl, { method: "PUT", body });
+    response = await fetchImpl(uploadUrl, {
+      method: "PUT",
+      body,
+      // Real S3 answers 411 MissingContentLength to a chunked PUT, and a size-less stream ending
+      // early would be stored as a silently truncated object; the exact size keeps the body
+      // streamed while forcing a loud failure on a short upload.
+      headers: { "Content-Length": String(totalBytes) },
+    });
   } catch (error) {
     throw new SourceTransferError(
       "S3_UPLOAD_REQUEST_FAILED",

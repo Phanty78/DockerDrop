@@ -28,7 +28,7 @@ export type SourceTransferErrorCode =
   | "TRANSFER_CREATE_FAILED"
   /** A PATCH /transfers/{id} status change was refused or the transport failed. */
   | "TRANSFER_STATUS_UPDATE_FAILED"
-  /** The PUT to the presigned URL failed at the transport level (network, invalid URL). */
+  /** The archive could not be opened for upload, or the PUT to the presigned URL failed at the transport level (network, invalid URL). */
   | "S3_UPLOAD_REQUEST_FAILED"
   /** S3 answered the PUT with a non-2xx status (403 SignatureDoesNotMatch, 410 expired…). */
   | "S3_UPLOAD_REJECTED";
@@ -68,10 +68,20 @@ export interface SourceTransferClient {
   updateStatus(transferId: string, status: SourceTransferStatus, archiveSize?: number): Promise<void>;
 }
 
+/**
+ * Minimal injectable HTTP transport: the global `fetch` satisfies it, and
+ * test fakes type-check without casting (`typeof fetch` would drag in Bun's
+ * non-callable `preconnect` member).
+ */
+export type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
 /** Extra deps of the direct S3 PUT; both injectable so tests stay deterministic. */
 export interface UploadArchiveDeps {
   /** HTTP transport; defaults to the global fetch. */
-  readonly fetchImpl?: typeof fetch;
+  readonly fetchImpl?: FetchLike;
   /** Called with cumulative uploaded bytes on every chunk; the last call is (total, total). */
   readonly onProgress?: (bytesUploaded: number, totalBytes: number) => void;
 }

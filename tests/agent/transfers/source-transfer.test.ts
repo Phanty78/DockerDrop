@@ -39,18 +39,31 @@ const RECIPIENT_USER_ID = "thomas";
 const VOLUME_NAME = "mysql_client_x";
 const EXPIRES_AT = "2026-09-27T00:00:00.000Z";
 
-/** Deterministic multi-chunk "tar" payload; 4 KB so the archive streams through several chunks. */
+/**
+ * Deterministic multi-chunk "tar" payload: xorshift32 noise, so the bytes are non-periodic and
+ * therefore incompressible. A repeating pattern would shrink the compressed archive below the
+ * 1 KiB body guard of the end-to-end test, letting its "the backend never transports the archive"
+ * assertion pass even on a regression.
+ */
 function payloadBytes(sizeBytes: number): Uint8Array {
   const bytes = new Uint8Array(sizeBytes);
+  let state = 0x9e3779b9;
 
   for (let index = 0; index < sizeBytes; index += 1) {
-    bytes[index] = (index * 37 + 11) % 256;
+    // xorshift32 (Marsaglia): one step of the 32-bit state per byte, so no short cycle repeats.
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+
+    bytes[index] = state & 0xff;
   }
 
   return bytes;
 }
 
-const TAR_PAYLOAD = payloadBytes(4 * 1024);
+/** 8 KB payload, a multiple of `TAR_CHUNK_SIZE`: several chunks, and over 1 KiB once compressed. */
+const TAR_PAYLOAD = payloadBytes(8 * 1024);
 
 /** Chunk size of the fake tar stream: a divisor of the payload, so every chunk but the last is full. */
 const TAR_CHUNK_SIZE = 512;
